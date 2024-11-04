@@ -29,9 +29,10 @@ static inline int nextPow2(int n) {
 
 // Helper function for exclusive_scan; performs the parallel portion
 // of the upsweep stage. 
-__global__ void upsweep_kernel(int * result, int two_d, int two_dplus1, int N) {
-    int i = (blockIdx.x*blockDim.x + threadIdx.x) * two_dplus1;
-    if (i + two_dplus1 - 1 < N) {
+__global__ void upsweep_kernel(int * result, int two_d, int two_dplus1, int num_tasks) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; 
+    if (i < num_tasks) {
+        i *= two_dplus1; 
         result[i+two_dplus1-1] += result[i+two_d-1];
     }
 }
@@ -39,9 +40,10 @@ __global__ void upsweep_kernel(int * result, int two_d, int two_dplus1, int N) {
 
 // Helper function for exclusive_scan; performs the parallel portion
 // of the downsweep stage. 
-__global__ void downsweep_kernel(int * result, int two_d, int two_dplus1, int N) {
-    int i = (blockIdx.x*blockDim.x + threadIdx.x) * two_dplus1;  
-    if (i + two_dplus1 - 1 < N) {
+__global__ void downsweep_kernel(int * result, int two_d, int two_dplus1, int num_tasks) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;  
+    if (i < num_tasks) {
+        i *= two_dplus1;
         int t = result[i+two_d-1];
         result[i+two_d-1] = result[i+two_dplus1-1];
         result[i+two_dplus1-1] += t; 
@@ -86,25 +88,22 @@ void exclusive_scan(int* input, int N, int* result)
         printf("Error: rounded_N (%d) is less than N (%d)\n", rounded_N, N);
     }
 
-    N = nextPow2(N); 
-
-    for (int two_d = 1; two_d <= N/2; two_d *= 2) {
+    for (int two_d = 1; two_d <= rounded_N/2; two_d *= 2) {
         int two_dplus1 = 2*two_d;
-        int num_tasks = (N + two_dplus1) / two_dplus1;
-        int blocks = (num_tasks + THREADS_PER_BLOCK) / THREADS_PER_BLOCK;
-        upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, two_dplus1, N);
+        int num_tasks = (rounded_N + two_dplus1 - 1) / two_dplus1;
+        int blocks = (num_tasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, two_dplus1, num_tasks);
         cudaDeviceSynchronize();
     }
 
-    // output[N - 1] = 0;  Why doesn't this work?
-    set_zero_kernel<<<1, 1>>>(result, N); 
+    set_zero_kernel<<<1, 1>>>(result, rounded_N); 
     cudaDeviceSynchronize(); 
 
-    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+    for (int two_d = rounded_N/2; two_d >= 1; two_d /= 2) {
         int two_dplus1 = 2*two_d;
-        int num_tasks = (N + two_dplus1) / two_dplus1;
-        int blocks = (num_tasks + THREADS_PER_BLOCK) / THREADS_PER_BLOCK;
-        downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, two_dplus1, N);
+        int num_tasks = (rounded_N + two_dplus1 - 1) / two_dplus1;
+        int blocks = (num_tasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, two_dplus1, num_tasks);
         cudaDeviceSynchronize();
     }
 }
@@ -192,29 +191,28 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 // Helper function for find_repeats. Populate scattered_indices such that 
-// [i] = 1 if [i] = [i+1], otherwise [i] = 0.
-__global__ void mark_indices(int * device_input, int * scattered_indices, int length) {
+// [i + 1] = 1 if [i] = [i+1], otherwise [i + 1] = 0.
+__global__ void mark_indices(int * device_input, int * indices, int length) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < length - 1) {
         if (device_input[i] == device_input[i + 1]) {
-            scattered_indices[i] = 1;
+            indices[i] = 1;
         } else {
-            scattered_indices[i] = 0; 
+            indices[i] = 0; 
         }
     }
-    scattered_indices[length - 1] = 0; 
 }
 
 // Helper function for find_repeats. Lists duplicates in device_output
 // using the implicit indices in exclusive_scan_output. 
-__global__ void list_duplicates(int * exclusive_scan_output, int * device_output, int length, int * d_num_duplicates) {
+__global__ void list_duplicates(int * indices_prefix_sum, int * device_output, int length, int * d_num_duplicates) {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < length - 1) {
-        if (exclusive_scan_output[i] != exclusive_scan_output[i + 1]) {
-            device_output[exclusive_scan_output[i]] = i;
+        if (indices_prefix_sum[i] != indices_prefix_sum[i + 1]) {
+            device_output[indices_prefix_sum[i]] = i;
         }
     } else if (i == length - 1) {
-        *d_num_duplicates = exclusive_scan_output[i];
+        *d_num_duplicates = indices_prefix_sum[i];
     }
 }
 
@@ -238,36 +236,36 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    int* scattered_indices = nullptr; // device memory
-    int* exclusive_scan_output = nullptr; // device memory
+    int* indices = nullptr; // device memory
+    int* indices_prefix_sum = nullptr; // device memory
 
     int* d_num_duplicates = nullptr; // device memory
     int num_duplicates; // local memory
 
-    int N = sizeof(device_input) / sizeof(int);
+    int N = nextPow2(length);
+    int blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
-    cudaMalloc(&scattered_indices, length*sizeof(int));
-    cudaMalloc(&exclusive_scan_output, length*sizeof(int));
+    cudaMalloc(&indices, N*sizeof(int));
+    cudaMalloc(&indices_prefix_sum, N*sizeof(int));
     cudaMalloc(&d_num_duplicates, sizeof(int));
 
-    int blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-
-    // Mark indices in scattered_output that satisfy requireents.
-    mark_indices<<<blocks, THREADS_PER_BLOCK>>>(device_input, scattered_indices, length);
+    // Mark indices in scattered_output that satisfy requirements.
+    mark_indices<<<blocks, THREADS_PER_BLOCK>>>(device_input, indices, length);
     cudaDeviceSynchronize();
 
     // Perform exclusive_scan on scattered_indices.
-    exclusive_scan(scattered_indices, N, exclusive_scan_output);
+    exclusive_scan(indices, length, indices_prefix_sum);
+    cudaDeviceSynchronize(); 
 
     // Using exclusive_scan_output, populate device_output and d_num_duplicates. 
-    list_duplicates<<<blocks, THREADS_PER_BLOCK>>>(exclusive_scan_output, device_output, length, d_num_duplicates); 
+    list_duplicates<<<blocks, THREADS_PER_BLOCK>>>(indices_prefix_sum, device_output, length, d_num_duplicates); 
 
     cudaDeviceSynchronize();
 
     cudaMemcpy(&num_duplicates, d_num_duplicates, sizeof(int), cudaMemcpyDeviceToHost);
 
-    cudaFree(scattered_indices); 
-    cudaFree(exclusive_scan_output);
+    cudaFree(indices_prefix_sum); 
+    cudaFree(indices);
     cudaFree(d_num_duplicates); 
 
     return num_duplicates; 

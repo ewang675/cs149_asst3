@@ -84,9 +84,6 @@ void exclusive_scan(int* input, int N, int* result)
     cudaMemcpy(result, input, N*sizeof(int), cudaMemcpyDeviceToDevice);
 
     int rounded_N = nextPow2(N);
-    if (rounded_N < N) {
-        printf("Error: rounded_N (%d) is less than N (%d)\n", rounded_N, N);
-    }
 
     for (int two_d = 1; two_d <= rounded_N/2; two_d *= 2) {
         int two_dplus1 = 2*two_d;
@@ -236,18 +233,18 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    int* indices = nullptr; // device memory
-    int* indices_prefix_sum = nullptr; // device memory
-
-    int* d_num_duplicates = nullptr; // device memory
-    int num_duplicates; // local memory
-
     int N = nextPow2(length);
     int blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    int* indices = nullptr; 
+    int* indices_prefix_sum = nullptr; 
+    int* d_num_duplicates = nullptr; 
 
     cudaMalloc(&indices, N*sizeof(int));
     cudaMalloc(&indices_prefix_sum, N*sizeof(int));
     cudaMalloc(&d_num_duplicates, sizeof(int));
+
+    int num_duplicates; 
 
     // Mark indices in scattered_output that satisfy requirements.
     mark_indices<<<blocks, THREADS_PER_BLOCK>>>(device_input, indices, length);
@@ -259,7 +256,6 @@ int find_repeats(int* device_input, int length, int* device_output) {
 
     // Using exclusive_scan_output, populate device_output and d_num_duplicates. 
     list_duplicates<<<blocks, THREADS_PER_BLOCK>>>(indices_prefix_sum, device_output, length, d_num_duplicates); 
-
     cudaDeviceSynchronize();
 
     cudaMemcpy(&num_duplicates, d_num_duplicates, sizeof(int), cudaMemcpyDeviceToHost);

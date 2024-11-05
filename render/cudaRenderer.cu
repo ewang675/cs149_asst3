@@ -55,6 +55,7 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+#include "circleBoxTest.cu_inl"
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -427,6 +428,89 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+__global__ void createPixelMask(__device__ uint8_t* pixel_bitmask) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index >= cuConstRendererParams.numCircles)
+        return;
+
+    int index3 = 3 * index;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float rad = cuConstRendererParams.radius[index];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // clamp the bounding box 
+    short screenMinX = max(0, min(minX, imageWidth));
+    short screenMaxX = max(0, min(maxX, imageWidth));
+    short screenMinY = max(0, min(minY, imageHeight));
+    short screenMaxY = max(0, min(maxY, imageHeight));
+
+    // for each pixel in the bounding box, determine if it is 
+    // affected by this circle. if so, update bitmask accordingly
+    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
+        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
+            // This is really slow:
+            int bitPosition = ((imageWidth * pixelY + pixelX) * cuConstRendererParams.numCircles + index);
+            int elementIndex = bitPosition / (sizeof(unsigned int) * 8);
+            int bitOffset = bitPosition % (sizeof(unsigned int) * 8);
+            pixel_bitmask[elementIndex] |= (1 << bitOffset);
+
+            float diffX = pixelX - p.x;
+            float diffY = pixelY - p.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+
+            float rad = cuConstRendererParams.radius[index];;
+            float maxDist = rad * rad;
+
+            // circle does contribute to the pixel
+            if (pixelDist <= maxDist) {
+                pixel_bitmask[elementIndex] |= (1 << bitOffset);
+            } else {
+                pixel_bitmask[elementIndex] &= ~(1 << bitOffset);
+            }
+        }
+    }
+}
+
+__global__ void renderPixels(__device__ uint8_t* pixel_bitmask) {
+    int pixelIndex = blockIdx.x*blockDim.x + threadIdx.x;
+    int pixelBitStart = pixelIndex * cuConstRendererParams.numCircles; 
+
+    float4 pixelState = *(float4*)(&cuConstRendererParams.imageData[4 * pixelIndex]);
+
+    for (int circle_index = 0; circle_index < cuConstRendererParams.numCircles; circle_index++) {
+        int bitPosition = pixelBitStart + circle_index;  // Calculate the bit position for this index
+        int elementIndex = bitPosition / (sizeof(unsigned int) * 8);  // Find the element in the array
+        int bitOffset = bitPosition % (sizeof(unsigned int) * 8);     // Find the bit offset within the element
+
+        // if bit is nonzero, update using that circle
+        if (pixel_bitmask[elementIndex] & (1 << bitOffset)) {
+            // // get the assigned color for the circle
+            // int index3 = 3 * circle_index;
+            // // float3 rgb = (float3) (pixelState);
+            // float alpha = .5f;
+            // float oneMinusAlpha = 1.f - alpha;
+
+            // pixelState.x = alpha * rgb.x + oneMinusAlpha * pixelState.x;
+            // pixelState.y = alpha * rgb.y + oneMinusAlpha * pixelState.y;
+            // pixelState.z = alpha * rgb.z + oneMinusAlpha * pixelState.z;
+            // pixelState.w = alpha + pixelState.w;
+        }
+    }
+
+
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -635,11 +719,24 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
+    int numPixels = cuConstRendererParams.imageWidth * cuConstRendererParams.imageWidth; 
 
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 circleGridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 pixelGridDim((numPixels + blockDim.x - 1) / blockDim.x); 
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    __device__ uint8_t* pixel_bitmask; 
+    cudaMalloc(&pixel_bitmask, numPixels);
+
+    createPixelMask<<<circleGridDim, blockDim>>>(pixel_bitmask); 
     cudaDeviceSynchronize();
+
+    renderPixels<<<pixelGridDim, blockDim>>>(pixel_bitmask); 
+    cudaDeviceSynchronize();
+
+    cudaFree(pixel_bitmask); 
+
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
 }

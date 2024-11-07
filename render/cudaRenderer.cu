@@ -322,13 +322,14 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
-
-    float diffX = p.x - pixelCenter.x;
-    float diffY = p.y - pixelCenter.y;
+shadePixel(const float x, const float y, float4* imagePtr, const int circleIndex) { 
+    int index3 = 3 * circleIndex;
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float rad = cuConstRendererParams.radius[circleIndex];
+    float diffX = p.x - x;
+    float diffY = p.y - y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
@@ -360,7 +361,6 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     } else {
         // simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
         rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
     }
@@ -383,52 +383,12 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= cuConstRendererParams.numCircles)
-        return;
-
-    int index3 = 3 * index;
-
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
-
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
-        }
-    }
+__device__ __inline__ bool circlePixelTest(float3 p, float rad, float x, float y) {
+    float diffX = p.x - x;
+    float diffY = p.y - y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+    float maxDist = rad * rad;
+    return pixelDist <= maxDist;
 }
 
 __global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts) {
@@ -440,58 +400,37 @@ __global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts) {
     float invHeight = 1.f / cuConstRendererParams.imageHeight;
     int pixelX = index % cuConstRendererParams.imageWidth;
     int pixelY = index / cuConstRendererParams.imageWidth;
-    int boxX = pixelX / 16;
-    int boxY = pixelY / 16;
-    int boxIndex = boxY * (cuConstRendererParams.imageWidth / 16) + boxX;
+    int boxX = pixelX / BOX_WIDTH;
+    int boxY = pixelY / BOX_WIDTH;
+    int boxIndex = boxY * (cuConstRendererParams.imageWidth / BOX_WIDTH) + boxX;
     float x = invWidth * (static_cast<float>(pixelX) + 0.5f);
     float y = invHeight * (static_cast<float>(pixelY) + 0.5f);
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * index]);
-    float4 newColor = make_float4(imgPtr->x, imgPtr->y, imgPtr->z, imgPtr->w);
+    float4 newColor = *imgPtr;
 
     // For each circle in the scene, check if it overlaps the pixel
     // and update the pixel color accordingly
     // printf("boxIndex: %d, circleCounts[boxIndex]: %d\n", boxIndex, circleCounts[boxIndex]);
     for (int circleIndex = 0; circleIndex < circleCounts[boxIndex]; circleIndex++) {
         int i = circlesInBox[boxIndex * MAX_CIRCLES_PER_BOX + circleIndex];
-        int index3 = 3 * i;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[i];
-
-        float diffX = p.x - x;
-        float diffY = p.y - y;
-        float pixelDist = diffX * diffX + diffY * diffY;
-        float maxDist = rad * rad;
-
-        // printf("boxIndex: %d, i: %d, pixelDist: %f, maxDist: %f\n", boxIndex, circleIndex, pixelDist, maxDist);
-
-        float3 rgb;
-        float alpha;
-        if (pixelDist <= maxDist) {
-            // printf("x: %f, y: %f, p.x: %f, p.y: %f, rad: %f\n", x, y, p.x, p.y, rad);
-            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-                const float kCircleMaxAlpha = .5f;
-                const float falloffScale = 4.f;
-
-                float normPixelDist = sqrt(pixelDist) / rad;
-                rgb = lookupColor(normPixelDist);
-
-                float maxAlpha = .6f + .4f * (1.f-p.z);
-                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
-                alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
-            } else {
-                // simple: each circle has an assigned color
-                rgb = *(float3*)&(cuConstRendererParams.color[index3]);
-                alpha = .5f;
-            }
-
-            newColor.x = alpha * rgb.x + (1.f - alpha) * newColor.x;
-            newColor.y = alpha * rgb.y + (1.f - alpha) * newColor.y;
-            newColor.z = alpha * rgb.z + (1.f - alpha) * newColor.z;
-            newColor.w = alpha + newColor.w;
-        }
+        shadePixel(x, y, &newColor, i);
     }
     *imgPtr = newColor;
+}
+
+// __device__ __inline__ bool circleBoxTest(float3 p, float rad, float boxXStart, float boxYStart, float boxXEnd, float boxYEnd) {
+//     return (p.x >= boxXStart - rad && p.x <= boxXEnd + rad && p.y >= boxYStart - rad && p.y <= boxYEnd + rad);
+// }
+
+__device__ __inline__ void addCircleToBox(int* circlesInBox, int* circleCounts, const int boxIndex, const int circleIndex, float4 bbox) {
+    int index3 = 3 * circleIndex;
+    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    float rad = cuConstRendererParams.radius[circleIndex];
+    if (p.x >= bbox.x - rad && p.x <= bbox.z + rad && p.y >= bbox.y - rad && p.y <= bbox.w + rad) {
+        int circleCount = circleCounts[boxIndex];
+        circlesInBox[boxIndex * MAX_CIRCLES_PER_BOX + circleCount] = circleIndex;
+        circleCounts[boxIndex] = circleCount + 1;
+    }
 }
 
 __global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts) {
@@ -510,19 +449,12 @@ __global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts) {
     float boxXEnd = invWidth * (static_cast<float>(boxX + 1) + 0.5f);
     float boxYStart = invHeight * (static_cast<float>(boxY) - 0.5f);
     float boxYEnd = invHeight * (static_cast<float>(boxY + 1) + 0.5f);
+    float4 bbox = make_float4(boxXStart, boxYStart, boxXEnd, boxYEnd);
 
     // printf("Box %d: x: %d, y: %d, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", index, boxX, boxY, boxXStart, boxYStart, boxXEnd, boxYEnd);
 
     for (int i = 0; i < cuConstRendererParams.numCircles; i++) {
-        int index3 = 3 * i;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[i];
-        // printf("x: %f, y: %f, rad: %f, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", p.x, p.y, rad, boxXStart, boxYStart, boxXEnd, boxYEnd);
-        if (p.x >= boxXStart - rad && p.x <= boxXEnd + rad && p.y >= boxYStart - rad && p.y <= boxYEnd + rad) {
-            int circleIndex = circleCounts[index];
-            circlesInBox[index * MAX_CIRCLES_PER_BOX + circleIndex] = i;
-            circleCounts[index] = circleCounts[index] + 1;
-        }
+        addCircleToBox(circlesInBox, circleCounts, index, i, bbox);
     }
     // printf("Box %d: circleCounts: %d\n", index, circleCounts[index]);
 }
@@ -758,4 +690,7 @@ CudaRenderer::render() {
     // kernelRenderCircles<<<gridDim, blockDim>>>();
     kernelRenderPixels<<<gridDim, blockDim>>>(circlesInBox, circleCounts);
     cudaDeviceSynchronize();
+
+    cudaFree(circlesInBox);
+    cudaFree(circleCounts);
 }

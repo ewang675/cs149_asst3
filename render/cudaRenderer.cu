@@ -34,8 +34,8 @@ struct GlobalConstants {
     float* imageData;
 };
 
-#define BOX_WIDTH 16
-#define MAX_CIRCLES_PER_BOX 4096
+#define BOX_WIDTH 32
+#define MAX_CIRCLES_PER_BOX 10000
 
 // Global variable that is in scope, but read-only, for all cuda
 // kernels.  The __constant__ modifier designates this variable will
@@ -432,17 +432,18 @@ __global__ void kernelRenderCircles() {
 }
 
 __global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts) {
+    int boxX = blockIdx.x;
+    int boxY = blockIdx.y;
+    int boxIndex = boxY * (cuConstRendererParams.imageWidth / BOX_WIDTH) + boxX;
+    int pixelX = threadIdx.x + boxX * BOX_WIDTH;
+    int pixelY = threadIdx.y + boxY * BOX_WIDTH;
+    int index = pixelY * cuConstRendererParams.imageWidth + pixelX;
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= cuConstRendererParams.imageHeight * cuConstRendererParams.imageWidth)
         return;
     float invWidth = 1.f / cuConstRendererParams.imageWidth;
     float invHeight = 1.f / cuConstRendererParams.imageHeight;
-    int pixelX = index % cuConstRendererParams.imageWidth;
-    int pixelY = index / cuConstRendererParams.imageWidth;
-    int boxX = pixelX / 16;
-    int boxY = pixelY / 16;
-    int boxIndex = boxY * (cuConstRendererParams.imageWidth / 16) + boxX;
+    // printf("pixelX: %d, pixelY: %d\n", pixelX, pixelY);
     float x = invWidth * (static_cast<float>(pixelX) + 0.5f);
     float y = invHeight * (static_cast<float>(pixelY) + 0.5f);
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * index]);
@@ -495,15 +496,19 @@ __global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts) {
 }
 
 __global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int boxX = threadIdx.x;
+    int boxY = threadIdx.y;
+    int blockX = blockIdx.x;
+    int blockY = blockIdx.y;
+
     int boxWidth = BOX_WIDTH;
     int numHorizontalBoxes = cuConstRendererParams.imageWidth / boxWidth;
     int numVerticalBoxes = cuConstRendererParams.imageHeight / boxWidth;
     int numBoxes = numHorizontalBoxes * numVerticalBoxes;
+    int index = boxY * BOX_WIDTH + boxX + BOX_WIDTH * BOX_WIDTH * (blockY * numHorizontalBoxes + blockX);
     if (index >= numBoxes)
         return;
-    int boxX = index % numHorizontalBoxes;
-    int boxY = index / numHorizontalBoxes;
+
     float invWidth = 1.f / numHorizontalBoxes;
     float invHeight = 1.f / numVerticalBoxes;
     float boxXStart = invWidth * (static_cast<float>(boxX) - 0.5f);
@@ -524,7 +529,9 @@ __global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts) {
             circleCounts[index] = circleCounts[index] + 1;
         }
     }
-    // printf("Box %d: circleCounts: %d\n", index, circleCounts[index]);
+    // if (circleCounts[index] > MAX_CIRCLES_PER_BOX) {
+    //     printf("Box %d: circleCounts: %d\n", index, circleCounts[index]);
+    // }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -738,10 +745,9 @@ CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
     int boxWidth = BOX_WIDTH;
-    dim3 blockDim(boxWidth * boxWidth, 1);
+    dim3 blockDim(boxWidth, boxWidth);
     int numBoxes = (image->width / boxWidth) * (image->height / boxWidth);
-    int numPixels = image->width * image->height;
-    dim3 gridDim((numPixels + blockDim.x - 1) / blockDim.x);
+    dim3 gridDim((image->width + boxWidth - 1) / boxWidth, (image->height + boxWidth - 1) / boxWidth);
     // Allocate memory for the data structure to keep track of circles in boxes
     int* circlesInBox;
     int* circleCounts;

@@ -8,6 +8,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
+#include <thrust/scan.h>
+#include <thrust/execution_policy.h>
+#include <thrust/functional.h>
 
 #include "cudaRenderer.h"
 #include "image.h"
@@ -34,8 +37,9 @@ struct GlobalConstants {
     float* imageData;
 };
 
-#define BOX_WIDTH 16
-#define MAX_CIRCLES_PER_BOX 4096
+#define BLOCK_DIM 256
+#define NUM_HORIZ_BOXES 16
+#define NUM_VERT_BOXES 16
 
 // Global variable that is in scope, but read-only, for all cuda
 // kernels.  The __constant__ modifier designates this variable will
@@ -391,7 +395,7 @@ __device__ __inline__ bool circlePixelTest(float3 p, float rad, float x, float y
     return pixelDist <= maxDist;
 }
 
-__global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts) {
+__global__ void kernelRenderPixels(int* circleInBoxIndexes) {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= cuConstRendererParams.imageHeight * cuConstRendererParams.imageWidth)
@@ -400,63 +404,110 @@ __global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts) {
     float invHeight = 1.f / cuConstRendererParams.imageHeight;
     int pixelX = index % cuConstRendererParams.imageWidth;
     int pixelY = index / cuConstRendererParams.imageWidth;
-    int boxX = pixelX / BOX_WIDTH;
-    int boxY = pixelY / BOX_WIDTH;
-    int boxIndex = boxY * (cuConstRendererParams.imageWidth / BOX_WIDTH) + boxX;
+    int boxWidth = (cuConstRendererParams.imageWidth + NUM_HORIZ_BOXES - 1) / NUM_HORIZ_BOXES;
+    int boxHeight = (cuConstRendererParams.imageHeight + NUM_VERT_BOXES - 1) / NUM_VERT_BOXES;
+    int boxX = pixelX / boxWidth;
+    int boxY = pixelY / boxHeight;
+    int boxIndex = boxY * NUM_HORIZ_BOXES + boxX;
     float x = invWidth * (static_cast<float>(pixelX) + 0.5f);
     float y = invHeight * (static_cast<float>(pixelY) + 0.5f);
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * index]);
     float4 newColor = *imgPtr;
 
-    // For each circle in the scene, check if it overlaps the pixel
+   // For each circle in the scene, check if it overlaps the pixel
     // and update the pixel color accordingly
     // printf("boxIndex: %d, circleCounts[boxIndex]: %d\n", boxIndex, circleCounts[boxIndex]);
-    for (int circleIndex = 0; circleIndex < circleCounts[boxIndex]; circleIndex++) {
-        int i = circlesInBox[boxIndex * MAX_CIRCLES_PER_BOX + circleIndex];
-        shadePixel(x, y, &newColor, i);
+    int circleIndex = 0;
+    while (circleInBoxIndexes[boxIndex * cuConstRendererParams.numCircles + circleIndex] > 0) {
+        int i = circleInBoxIndexes[boxIndex * cuConstRendererParams.numCircles + circleIndex];
+        printf("boxIndex: %d, circleIndex: %d, i: %d\n", boxIndex, circleIndex, i);
+        int index3 = 3 * i;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float rad = cuConstRendererParams.radius[i];
+
+        float diffX = p.x - x;
+        float diffY = p.y - y;
+        float pixelDist = diffX * diffX + diffY * diffY;
+        float maxDist = rad * rad;
+
+        // printf("boxIndex: %d, i: %d, pixelDist: %f, maxDist: %f\n", boxIndex, circleIndex, pixelDist, maxDist);
+
+        float3 rgb;
+        float alpha;
+        if (pixelDist <= maxDist) {
+            // printf("x: %f, y: %f, p.x: %f, p.y: %f, rad: %f\n", x, y, p.x, p.y, rad);
+            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+                const float kCircleMaxAlpha = .5f;
+                const float falloffScale = 4.f;
+
+                float normPixelDist = sqrt(pixelDist) / rad;
+                rgb = lookupColor(normPixelDist);
+
+                float maxAlpha = .6f + .4f * (1.f-p.z);
+                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+                alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+            } else {
+                // simple: each circle has an assigned color
+                rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+                alpha = .5f;
+            }
+
+            newColor.x = alpha * rgb.x + (1.f - alpha) * newColor.x;
+            newColor.y = alpha * rgb.y + (1.f - alpha) * newColor.y;
+            newColor.z = alpha * rgb.z + (1.f - alpha) * newColor.z;
+            newColor.w = alpha + newColor.w;
+        }
+        circleIndex++;
     }
     *imgPtr = newColor;
 }
 
-// __device__ __inline__ bool circleBoxTest(float3 p, float rad, float boxXStart, float boxYStart, float boxXEnd, float boxYEnd) {
-//     return (p.x >= boxXStart - rad && p.x <= boxXEnd + rad && p.y >= boxYStart - rad && p.y <= boxYEnd + rad);
-// }
-
-__device__ __inline__ void addCircleToBox(int* circlesInBox, int* circleCounts, const int boxIndex, const int circleIndex, float4 bbox) {
-    int index3 = 3 * circleIndex;
+__device__ __inline__ bool circleBoxTest(const int circleIdx, const int boxIdx) {
+    int index3 = 3 * circleIdx;
     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float rad = cuConstRendererParams.radius[circleIndex];
-    if (p.x >= bbox.x - rad && p.x <= bbox.z + rad && p.y >= bbox.y - rad && p.y <= bbox.w + rad) {
-        int circleCount = circleCounts[boxIndex];
-        circlesInBox[boxIndex * MAX_CIRCLES_PER_BOX + circleCount] = circleIndex;
-        circleCounts[boxIndex] = circleCount + 1;
-    }
-}
-
-__global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int boxWidth = BOX_WIDTH;
-    int numHorizontalBoxes = cuConstRendererParams.imageWidth / boxWidth;
-    int numVerticalBoxes = cuConstRendererParams.imageHeight / boxWidth;
-    int numBoxes = numHorizontalBoxes * numVerticalBoxes;
-    if (index >= numBoxes)
-        return;
-    int boxX = index % numHorizontalBoxes;
-    int boxY = index / numHorizontalBoxes;
-    float invWidth = 1.f / numHorizontalBoxes;
-    float invHeight = 1.f / numVerticalBoxes;
+    float rad = cuConstRendererParams.radius[circleIdx];
+    int boxX = boxIdx % NUM_HORIZ_BOXES;
+    int boxY = boxIdx / NUM_HORIZ_BOXES;
+    float invWidth = 1.f / NUM_HORIZ_BOXES;
+    float invHeight = 1.f / NUM_VERT_BOXES;
     float boxXStart = invWidth * (static_cast<float>(boxX) - 0.5f);
     float boxXEnd = invWidth * (static_cast<float>(boxX + 1) + 0.5f);
     float boxYStart = invHeight * (static_cast<float>(boxY) - 0.5f);
     float boxYEnd = invHeight * (static_cast<float>(boxY + 1) + 0.5f);
-    float4 bbox = make_float4(boxXStart, boxYStart, boxXEnd, boxYEnd);
 
-    // printf("Box %d: x: %d, y: %d, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", index, boxX, boxY, boxXStart, boxYStart, boxXEnd, boxYEnd);
+    return (p.x >= boxXStart - rad && p.x <= boxXEnd + rad && p.y >= boxYStart - rad && p.y <= boxYEnd + rad);
+}
 
-    for (int i = 0; i < cuConstRendererParams.numCircles; i++) {
-        addCircleToBox(circlesInBox, circleCounts, index, i, bbox);
+__global__ void assignCirclesToBoxes(int* circleInBox) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int numBoxes = NUM_HORIZ_BOXES * NUM_VERT_BOXES;
+    int numCircles = cuConstRendererParams.numCircles;
+    if (index >= numBoxes * numCircles)
+        return;
+    int boxIdx = index / numCircles;
+    int circleIdx = index % numCircles;
+
+    if (circleBoxTest(circleIdx, boxIdx)) {
+        circleInBox[index] = 1;
+    } else {
+        circleInBox[index] = 0;
     }
-    // printf("Box %d: circleCounts: %d\n", index, circleCounts[index]);
+}
+
+__global__ void getCircleIndexes(int* circleInBox, int* circleInBoxPrefixSum, int* circleInBoxIndexes) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int numBoxes = NUM_HORIZ_BOXES * NUM_VERT_BOXES;
+    int numCircles = cuConstRendererParams.numCircles;
+    if (index >= numBoxes * numCircles)
+        return;
+    int boxIdx = index / numCircles;
+    int circleIdx = index % numCircles;
+
+    if (circleInBox[index] == 1) {
+        // printf("boxIdx: %d, circleIdx: %d, circleInBoxPrefixSum[index]: %d\n", boxIdx, circleIdx, circleInBoxPrefixSum[index]);
+        circleInBoxIndexes[boxIdx * numCircles + circleInBoxPrefixSum[index]] = circleIdx;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -669,28 +720,44 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    int boxWidth = BOX_WIDTH;
-    dim3 blockDim(boxWidth * boxWidth, 1);
-    int numBoxes = (image->width / boxWidth) * (image->height / boxWidth);
+    dim3 blockDim(BLOCK_DIM, 1);
     int numPixels = image->width * image->height;
-    dim3 gridDim((numPixels + blockDim.x - 1) / blockDim.x);
+    int numBoxes = NUM_HORIZ_BOXES * NUM_VERT_BOXES;
     // Allocate memory for the data structure to keep track of circles in boxes
-    int* circlesInBox;
-    int* circleCounts;
-    cudaMalloc(&circlesInBox, sizeof(int) * numBoxes * MAX_CIRCLES_PER_BOX);
-    cudaMalloc(&circleCounts, sizeof(int) * numBoxes);
-    cudaMemset(circlesInBox, -1, sizeof(int) * numBoxes * MAX_CIRCLES_PER_BOX);
-    cudaMemset(circleCounts, 0, sizeof(int) * numBoxes);
+    int* circleInBox;
+    cudaMalloc(&circleInBox, sizeof(int) * numBoxes * numCircles);
+    cudaMemset(circleInBox, 0, sizeof(int) * numBoxes * numCircles);
 
     // Assign circles to boxes
-    assignCirclesToBoxes<<<gridDim, blockDim>>>(circlesInBox, circleCounts);
+    // int maxGridSize = ;
+    // if ((numPixels + blockDim.x - 1) / blockDim.x > maxGridSize) {
+    //     maxGridSize = ;
+    // }
 
+    dim3 gridDimAssign((numBoxes * numCircles + blockDim.x - 1) / blockDim.x);
+    assignCirclesToBoxes<<<gridDimAssign, blockDim>>>(circleInBox);
+
+    cudaDeviceSynchronize();
+
+    // use exclusive scan to get the indexes of the circles in each box
+    int* circleInBoxPrefixSum;
+    cudaMalloc(&circleInBoxPrefixSum, sizeof(int) * numBoxes * numCircles);
+    for (int i = 0; i < numBoxes; i++) {
+        thrust::exclusive_scan(thrust::device, circleInBox + (numCircles * i), circleInBox + (numCircles * (i + 1)), circleInBoxPrefixSum + (numCircles * i), 0, thrust::plus<int>());
+    }
+
+    int* circleInBoxIndexes;
+    cudaMalloc(&circleInBoxIndexes, sizeof(int) * numBoxes * numCircles);
+    cudaMemset(circleInBoxIndexes, -1, sizeof(int) * numBoxes * numCircles);
+    getCircleIndexes<<<gridDimAssign, blockDim>>>(circleInBox, circleInBoxPrefixSum, circleInBoxIndexes);
     cudaDeviceSynchronize();
 
     // kernelRenderCircles<<<gridDim, blockDim>>>();
-    kernelRenderPixels<<<gridDim, blockDim>>>(circlesInBox, circleCounts);
+    dim3 gridDimPixels((numPixels + blockDim.x - 1) / blockDim.x);
+    kernelRenderPixels<<<gridDimPixels, blockDim>>>(circleInBoxIndexes);
     cudaDeviceSynchronize();
 
-    cudaFree(circlesInBox);
-    cudaFree(circleCounts);
+    cudaFree(circleInBox);
+    cudaFree(circleInBoxPrefixSum);
+    cudaFree(circleInBoxIndexes);
 }

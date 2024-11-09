@@ -16,6 +16,7 @@
 #include "util.h"
 
 #include <bit>
+#include <chrono>
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -37,7 +38,7 @@ struct GlobalConstants {
 };
 
 #define BOX_WIDTH 16
-#define MAX_CIRCLES_PER_BOX 4096
+#define MAX_CIRCLES_PER_BOX 2500
 
 // Global variable that is in scope, but read-only, for all cuda
 // kernels.  The __constant__ modifier designates this variable will
@@ -524,6 +525,7 @@ __global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts) {
         float rad = cuConstRendererParams.radius[i];
         // printf("x: %f, y: %f, rad: %f, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", p.x, p.y, rad, boxXStart, boxYStart, boxXEnd, boxYEnd);
         if (p.x >= boxXStart - rad && p.x <= boxXEnd + rad && p.y >= boxYStart - rad && p.y <= boxYEnd + rad) {
+        // if (circleInBox(p.x, p.y, rad, boxXStart, boxXEnd, boxYEnd, boxYStart)) {
             int circleIndex = circleCounts[index];
             circlesInBox[index * numCirclesPerBox + circleIndex] = i;
             circleCounts[index] = circleCounts[index] + 1;
@@ -749,7 +751,7 @@ CudaRenderer::render() {
     dim3 gridDimBoxes((numBoxes + blockDim.x - 1) / blockDim.x);
     dim3 gridDimPixels((numPixels + blockDim.x - 1) / blockDim.x);
 
-    int numCirclesPerBox_local = min(MAX_CIRCLES_PER_BOX, numCircles); 
+    int numCirclesPerBox_local = min(numCircles, MAX_CIRCLES_PER_BOX); 
     cudaMemcpyToSymbol(numCirclesPerBox, &numCirclesPerBox_local, sizeof(int), 0, cudaMemcpyHostToDevice); 
 
     // Allocate memory for the data structure to keep track of circles in boxes
@@ -761,9 +763,18 @@ CudaRenderer::render() {
     cudaMemset(circleCounts, 0, sizeof(int) * numBoxes);
 
     // Assign circles to boxes
+    auto start = std::chrono::high_resolution_clock::now(); 
     assignCirclesToBoxes<<<gridDimBoxes, blockDim>>>(circlesInBox, circleCounts);
-
     cudaDeviceSynchronize();
+    auto middle = std::chrono::high_resolution_clock::now(); 
+
     kernelRenderPixels<<<gridDimPixels, blockDim>>>(circlesInBox, circleCounts);
     cudaDeviceSynchronize();
+    auto end = std::chrono::high_resolution_clock::now(); 
+
+    auto duration_one = std::chrono::duration_cast<std::chrono::microseconds>(middle - start);
+    auto duration_two = std::chrono::duration_cast<std::chrono::microseconds>(end - middle);
+
+    std::cout << "assignCirclesToBoxes:  " << duration_one.count() << " microseconds" << std::endl;
+    std::cout << "kernelRenderPixels:  " << duration_two.count() << " microseconds" << std::endl;
 }

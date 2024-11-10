@@ -57,12 +57,14 @@ __constant__ float  cuConstNoise1DValueTable[256];
 // color ramp table needed for the color ramp lookup shader
 #define COLOR_MAP_SIZE 5
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
+#define SCAN_BLOCK_DIM 1024
 
 // including parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
 #include "circleBoxTest.cu_inl"
+#include "exclusiveScan.cu_inl"
 
 // kernelClearImageSnowflake -- (CUDA device code)
 //
@@ -498,40 +500,52 @@ __global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts, int num
 }
 
 __global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts, int numCirclesPerBox, int batchIndex) {
-    int boxIndex = blockIdx.x * blockDim.x;
-    int circleIndex = threadIdx.x; 
-    int boxWidth = BOX_WIDTH;
-    int numHorizontalBoxes = cuConstRendererParams.imageWidth / boxWidth;
-    int numVerticalBoxes = cuConstRendererParams.imageHeight / boxWidth;
-    int numBoxes = numHorizontalBoxes * numVerticalBoxes;
-    if (boxIndex >= numBoxes)
-        return;
-    int boxX = boxIndex % numHorizontalBoxes;
-    int boxY = boxIndex / numHorizontalBoxes;
-    float invWidth = 1.f / numHorizontalBoxes;
-    float invHeight = 1.f / numVerticalBoxes;
-    float boxXStart = invWidth * (static_cast<float>(boxX) - 0.5f);
-    float boxXEnd = invWidth * (static_cast<float>(boxX + 1) + 0.5f);
-    float boxYStart = invHeight * (static_cast<float>(boxY) - 0.5f);
-    float boxYEnd = invHeight * (static_cast<float>(boxY + 1) + 0.5f);
-    int circleStart = batchIndex * NUM_CIRCLES_PER_BATCH;
-    int circleEnd = min(cuConstRendererParams.numCircles, (batchIndex + 1) * NUM_CIRCLES_PER_BATCH); 
+    int boxIndex = blockIdx.x; 
+    int offset = threadIdx.x; 
+    int circleIndex = batchIndex * NUM_CIRCLES_PER_BATCH + offset; 
+    __shared__ uint circleMask[NUM_CIRCLES_PER_BATCH];
 
-    // printf("Box %d: x: %d, y: %d, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", boxIndex, boxX, boxY, boxXStart, boxYStart, boxXEnd, boxYEnd);
-    // circleCounts[boxIndex] = 0;
-    // for (int circleIndex = circleStart; circleIndex < circleEnd; circleIndex++) {
+    if (circleIndex <= cuConstRendererParams.numCircles) {
+        printf("boxIndex: %d, circleIndex offset: %d, real circleIndex: %d\n", boxIndex, offset, circleIndex);
+        int boxWidth = BOX_WIDTH;
+        int numHorizontalBoxes = cuConstRendererParams.imageWidth / boxWidth;
+        int numVerticalBoxes = cuConstRendererParams.imageHeight / boxWidth;
+        int numBoxes = numHorizontalBoxes * numVerticalBoxes;
+        if (boxIndex >= numBoxes)
+            return;
+        int boxX = boxIndex % numHorizontalBoxes;
+        int boxY = boxIndex / numHorizontalBoxes;
+        float invWidth = 1.f / numHorizontalBoxes;
+        float invHeight = 1.f / numVerticalBoxes;
+        float boxXStart = invWidth * (static_cast<float>(boxX) - 0.5f);
+        float boxXEnd = invWidth * (static_cast<float>(boxX + 1) + 0.5f);
+        float boxYStart = invHeight * (static_cast<float>(boxY) - 0.5f);
+        float boxYEnd = invHeight * (static_cast<float>(boxY + 1) + 0.5f);
+
         int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
         float rad = cuConstRendererParams.radius[circleIndex];
-        // printf("x: %f, y: %f, rad: %f, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", p.x, p.y, rad, boxXStart, boxYStart, boxXEnd, boxYEnd);
         if (p.x >= boxXStart - rad && p.x <= boxXEnd + rad && p.y >= boxYStart - rad && p.y <= boxYEnd + rad) {
-        // if (circleInBox(p.x, p.y, rad, boxXStart, boxXEnd, boxYEnd, boxYStart)) {
-            int offset = circleCounts[boxIndex]; // find count of circles in this box
-            circlesInBox[boxIndex * numCirclesPerBox + offset] = circleIndex; // use that to determine offset in circlesInBox
-            circleCounts[boxIndex] = circleCounts[boxIndex] + 1; // increment count of circles in box
+            circleMask[offset] = 1;
+        } else {
+            circleMask[offset] = 0; 
         }
-    // }
-    // printf("Box %d: circleCounts: %d\n", boxIndex, circleCounts[boxIndex]);
+    }
+
+    __syncthreads();
+
+    __shared__ uint prefixSum_circleMask[NUM_CIRCLES_PER_BATCH];
+    __shared__ uint scratch[NUM_CIRCLES_PER_BATCH];
+    sharedMemExclusiveScan(offset, circleMask, prefixSum_circleMask, scratch, NUM_CIRCLES_PER_BATCH);
+
+    if (offset == NUM_CIRCLES_PER_BATCH - 1) {
+        circleCounts[circleIndex] = prefixSum_circleMask[offset]; 
+    }
+    if (circleIndex > cuConstRendererParams.numCircles) return;
+
+    if (circleMask[offset] != 0) {
+        circlesInBox[prefixSum_circleMask[offset]] = circleIndex;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////

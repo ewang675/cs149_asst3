@@ -16,7 +16,6 @@
 #include "util.h"
 
 #include <bit>
-#include <chrono>
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -38,8 +37,7 @@ struct GlobalConstants {
 };
 
 #define BOX_WIDTH 16
-#define MAX_CIRCLES_PER_BOX 400
-#define NUM_CIRCLES_PER_BATCH 1024
+#define MAX_CIRCLES_PER_BOX 4096
 
 // Global variable that is in scope, but read-only, for all cuda
 // kernels.  The __constant__ modifier designates this variable will
@@ -57,6 +55,7 @@ __constant__ float  cuConstNoise1DValueTable[256];
 // color ramp table needed for the color ramp lookup shader
 #define COLOR_MAP_SIZE 5
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
+__constant__ int numCirclesPerBox; 
 
 // including parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
@@ -434,7 +433,7 @@ __global__ void kernelRenderCircles() {
     }
 }
 
-__global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts, int numCirclesPerBox) {
+__global__ void kernelRenderPixels(int* circlesInBox) {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= cuConstRendererParams.imageHeight * cuConstRendererParams.imageWidth)
@@ -454,11 +453,13 @@ __global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts, int num
     // For each circle in the scene, check if it overlaps the pixel
     // and update the pixel color accordingly
     // printf("boxIndex: %d, circleCounts[boxIndex]: %d\n", boxIndex, circleCounts[boxIndex]);
-    for (int offset = 0; offset < circleCounts[boxIndex]; offset++) {
-        int circleIndex = circlesInBox[boxIndex * numCirclesPerBox + offset];
-        int index3 = 3 * circleIndex;
+    int circleIndex = 0; 
+    while (true) {
+        int i = circlesInBox[boxIndex * numCirclesPerBox + circleIndex];
+        if (i == -1) { break; }
+        int index3 = 3 * i;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[circleIndex];
+        float rad = cuConstRendererParams.radius[i];
 
         float diffX = p.x - x;
         float diffY = p.y - y;
@@ -493,44 +494,47 @@ __global__ void kernelRenderPixels(int* circlesInBox, int* circleCounts, int num
             newColor.z = alpha * rgb.z + (1.f - alpha) * newColor.z;
             newColor.w = alpha + newColor.w;
         }
+        circleIndex++; 
     }
     *imgPtr = newColor;
 }
 
-__global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts, int numCirclesPerBox, int batchIndex) {
-    int boxIndex = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void assignCirclesToBoxes(int* circlesInBox) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
     int boxWidth = BOX_WIDTH;
     int numHorizontalBoxes = cuConstRendererParams.imageWidth / boxWidth;
     int numVerticalBoxes = cuConstRendererParams.imageHeight / boxWidth;
     int numBoxes = numHorizontalBoxes * numVerticalBoxes;
-    if (boxIndex >= numBoxes)
+    if (index >= numBoxes)
         return;
-    int boxX = boxIndex % numHorizontalBoxes;
-    int boxY = boxIndex / numHorizontalBoxes;
+    int boxX = index % numHorizontalBoxes;
+    int boxY = index / numHorizontalBoxes;
     float invWidth = 1.f / numHorizontalBoxes;
     float invHeight = 1.f / numVerticalBoxes;
     float boxXStart = invWidth * (static_cast<float>(boxX) - 0.5f);
     float boxXEnd = invWidth * (static_cast<float>(boxX + 1) + 0.5f);
     float boxYStart = invHeight * (static_cast<float>(boxY) - 0.5f);
     float boxYEnd = invHeight * (static_cast<float>(boxY + 1) + 0.5f);
-    int circleStart = batchIndex * NUM_CIRCLES_PER_BATCH;
-    int circleEnd = min(cuConstRendererParams.numCircles, (batchIndex + 1) * NUM_CIRCLES_PER_BATCH); 
 
-    // printf("Box %d: x: %d, y: %d, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", boxIndex, boxX, boxY, boxXStart, boxYStart, boxXEnd, boxYEnd);
-    circleCounts[boxIndex] = 0;
-    for (int circleIndex = circleStart; circleIndex < circleEnd; circleIndex++) {
-        int index3 = 3 * circleIndex;
+    // printf("Box %d: x: %d, y: %d, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", index, boxX, boxY, boxXStart, boxYStart, boxXEnd, boxYEnd);
+    // circleInBox(
+    // float circleX, float circleY, float circleRadius,
+    // float boxL, float boxR, float boxT, float boxB)
+
+    int circleCount = 0; 
+    for (int i = 0; i < cuConstRendererParams.numCircles; i++) {
+        int index3 = 3 * i;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[circleIndex];
+        float rad = cuConstRendererParams.radius[i];
         // printf("x: %f, y: %f, rad: %f, boxXStart: %f, boxYStart: %f, boxXEnd: %f, boxYEnd: %f\n", p.x, p.y, rad, boxXStart, boxYStart, boxXEnd, boxYEnd);
         if (p.x >= boxXStart - rad && p.x <= boxXEnd + rad && p.y >= boxYStart - rad && p.y <= boxYEnd + rad) {
-        // if (circleInBox(p.x, p.y, rad, boxXStart, boxXEnd, boxYEnd, boxYStart)) {
-            int offset = circleCounts[boxIndex]; // find count of circles in this box
-            circlesInBox[boxIndex * numCirclesPerBox + offset] = circleIndex; // use that to determine offset in circlesInBox
-            circleCounts[boxIndex] = circleCounts[boxIndex] + 1; // increment count of circles in box
+            int circleIndex = circleCount; 
+            circlesInBox[index * numCirclesPerBox + circleIndex] = i;
+            circleCount ++; 
         }
     }
-    // printf("Box %d: circleCounts: %d\n", boxIndex, circleCounts[boxIndex]);
+    circlesInBox[index * numCirclesPerBox + circleCount] = -1;
+    // printf("Box %d: circleCounts: %d\n", index, circleCounts[index]);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -741,43 +745,26 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
+
     // 256 threads per block is a healthy number
     int boxWidth = BOX_WIDTH;
     dim3 blockDim(256, 1);
     int numBoxes = (image->width / boxWidth) * (image->height / boxWidth);
     int numPixels = image->width * image->height;
-    int numCirclesPerBox = min(MAX_CIRCLES_PER_BOX, numCircles); 
     dim3 gridDimBoxes((numBoxes + blockDim.x - 1) / blockDim.x);
     dim3 gridDimPixels((numPixels + blockDim.x - 1) / blockDim.x);
 
-    // Allocate double-buffered memory for the data structure to keep track of circles in boxes
-    int* circlesInBox[2];
-    int* circleCounts[2];
-    for (int i = 0; i < 2; ++i) {
-        cudaMalloc(&circlesInBox[i], sizeof(int) * numBoxes * numCirclesPerBox);
-        cudaMalloc(&circleCounts[i], sizeof(int) * numBoxes);
-        cudaMemset(circleCounts[i], 0, sizeof(int) * numBoxes);
-    }
+    int numCirclesPerBox_local = min(MAX_CIRCLES_PER_BOX, numCircles) + 1; 
+    cudaMemcpyToSymbol(numCirclesPerBox, &numCirclesPerBox_local, sizeof(int), 0, cudaMemcpyHostToDevice); 
 
-    int a = 0; // buffer that assignCirclesToBoxes will write to
-    int r = 1; // buffer that kernelRenderPixels will read from
-    int numBatches = (numCircles + NUM_CIRCLES_PER_BATCH - 1) / NUM_CIRCLES_PER_BATCH; // number of circle batches
-    int batchIndex = 0; 
+    // Allocate memory for the data structure to keep track of circles in boxes
+    int* circlesInBox;
+    cudaMalloc(&circlesInBox, sizeof(int) * numBoxes * numCirclesPerBox_local);
 
-    // Assign to first <=1024 circles
-    assignCirclesToBoxes<<<gridDimBoxes, blockDim>>>(circlesInBox[a], circleCounts[a], numCirclesPerBox, batchIndex);
+    // Assign circles to boxes
+    assignCirclesToBoxes<<<gridDimBoxes, blockDim>>>(circlesInBox);
+
     cudaDeviceSynchronize();
-
-    for (batchIndex = 1; batchIndex < numBatches; batchIndex ++) {
-        a = batchIndex % 2; // place this calculation inside the function?
-        r = (batchIndex + 1) % 2;
-
-        kernelRenderPixels<<<gridDimPixels, blockDim>>>(circlesInBox[r], circleCounts[r], numCirclesPerBox);
-        assignCirclesToBoxes<<<gridDimBoxes, blockDim>>>(circlesInBox[a], circleCounts[a], numCirclesPerBox, batchIndex);
-        cudaDeviceSynchronize(); 
-    }
-
-    // Render last <= 1024 circles
-    kernelRenderPixels<<<gridDimPixels, blockDim>>>(circlesInBox[a], circleCounts[a], numCirclesPerBox);
+    kernelRenderPixels<<<gridDimPixels, blockDim>>>(circlesInBox);
     cudaDeviceSynchronize();
 }

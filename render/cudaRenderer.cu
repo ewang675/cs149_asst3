@@ -38,7 +38,7 @@ struct GlobalConstants {
 };
 
 #define BOX_WIDTH 16
-#define MAX_CIRCLES_PER_BOX 400
+#define MAX_CIRCLES_PER_BOX 100
 #define NUM_CIRCLES_PER_BATCH 1024
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -505,8 +505,8 @@ __global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts, int n
     int circleIndex = batchIndex * NUM_CIRCLES_PER_BATCH + offset; 
     __shared__ uint circleMask[NUM_CIRCLES_PER_BATCH];
 
-    if (circleIndex <= cuConstRendererParams.numCircles) {
-        printf("boxIndex: %d, circleIndex offset: %d, real circleIndex: %d\n", boxIndex, offset, circleIndex);
+    if (circleIndex < cuConstRendererParams.numCircles) {
+        // printf("boxIndex: %d, circleIndex offset: %d, real circleIndex: %d\n", boxIndex, offset, circleIndex);
         int boxWidth = BOX_WIDTH;
         int numHorizontalBoxes = cuConstRendererParams.imageWidth / boxWidth;
         int numVerticalBoxes = cuConstRendererParams.imageHeight / boxWidth;
@@ -530,21 +530,26 @@ __global__ void assignCirclesToBoxes(int* circlesInBox, int* circleCounts, int n
         } else {
             circleMask[offset] = 0; 
         }
+    } else {
+        circleMask[offset] = 0; 
     }
 
     __syncthreads();
 
     __shared__ uint prefixSum_circleMask[NUM_CIRCLES_PER_BATCH];
-    __shared__ uint scratch[NUM_CIRCLES_PER_BATCH];
+    __shared__ uint scratch[NUM_CIRCLES_PER_BATCH * 2];
     sharedMemExclusiveScan(offset, circleMask, prefixSum_circleMask, scratch, NUM_CIRCLES_PER_BATCH);
 
     if (offset == NUM_CIRCLES_PER_BATCH - 1) {
-        circleCounts[circleIndex] = prefixSum_circleMask[offset]; 
+        circleCounts[boxIndex] = prefixSum_circleMask[offset] + circleMask[offset]; 
+        if (boxIndex <= 3200 && boxIndex >= 3190 && batchIndex == 0) { printf("circleCounts[%d] = %d\n", boxIndex, prefixSum_circleMask[offset]); }
     }
-    if (circleIndex > cuConstRendererParams.numCircles) return;
+    if (circleIndex >= cuConstRendererParams.numCircles) return;
 
     if (circleMask[offset] != 0) {
-        circlesInBox[prefixSum_circleMask[offset]] = circleIndex;
+        int flagIndex = boxIndex * numCirclesPerBox + prefixSum_circleMask[offset]; 
+        circlesInBox[flagIndex] = circleIndex;
+        // if (boxIndex <= 3200 && boxIndex >= 3190) { printf("marking circle %d in box %d. circlesInBox[%d] = %d.\n", circleIndex, boxIndex, flagIndex, circleIndex); }
     }
 }
 
@@ -763,10 +768,12 @@ CudaRenderer::render() {
     int numCirclesPerBox = min(MAX_CIRCLES_PER_BOX, numCircles); 
 
     dim3 scanDim(NUM_CIRCLES_PER_BATCH, 1); 
-    dim3 gridDimScan((numBoxes * NUM_CIRCLES_PER_BATCH + scanDim.x - 1) / scanDim.x);
+    dim3 gridDimScan(numBoxes, 1);
 
     dim3 renderDim(256, 1);
     dim3 gridDimRender((numPixels + renderDim.x - 1) / renderDim.x);
+
+    int sharedMemSize = NUM_CIRCLES_PER_BATCH * 4; 
 
     // Allocate double-buffered memory for the data structure to keep track of circles in boxes
     int* circlesInBox[2];
@@ -774,7 +781,6 @@ CudaRenderer::render() {
     for (int i = 0; i < 2; ++i) {
         cudaMalloc(&circlesInBox[i], sizeof(int) * numBoxes * numCirclesPerBox);
         cudaMalloc(&circleCounts[i], sizeof(int) * numBoxes);
-        cudaMemset(circleCounts[i], 0, sizeof(int) * numBoxes);
     }
 
     int a = 0; // buffer that assignCirclesToBoxes will write to
@@ -783,7 +789,7 @@ CudaRenderer::render() {
     int batchIndex = 0; 
 
     // Assign to first <=1024 circles
-    assignCirclesToBoxes<<<gridDimScan, scanDim>>>(circlesInBox[a], circleCounts[a], numCirclesPerBox, batchIndex);
+    assignCirclesToBoxes<<<gridDimScan, scanDim, sharedMemSize>>>(circlesInBox[a], circleCounts[a], numCirclesPerBox, batchIndex);
     cudaDeviceSynchronize();
 
     for (batchIndex = 1; batchIndex < numBatches; batchIndex ++) {
@@ -791,7 +797,7 @@ CudaRenderer::render() {
         r = (batchIndex + 1) % 2;
 
         kernelRenderPixels<<<gridDimRender, renderDim>>>(circlesInBox[r], circleCounts[r], numCirclesPerBox);
-        assignCirclesToBoxes<<<gridDimScan, scanDim>>>(circlesInBox[a], circleCounts[r], numCirclesPerBox, batchIndex);
+        assignCirclesToBoxes<<<gridDimScan, scanDim, sharedMemSize>>>(circlesInBox[a], circleCounts[r], numCirclesPerBox, batchIndex);
         cudaDeviceSynchronize(); 
     }
 

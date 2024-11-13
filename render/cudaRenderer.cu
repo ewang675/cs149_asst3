@@ -18,6 +18,8 @@
 #include <bit>
 #include <chrono>
 
+static short * cudaDeviceCirclesInBox = nullptr;
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -35,10 +37,12 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+
+    short * circlesInBox; 
 };
 
 #define BOX_WIDTH 16
-#define MAX_CIRCLES_PER_BOX 400
+#define MAX_CIRCLES_PER_BOX 1024
 #define NUM_CIRCLES_PER_BATCH 1024
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -436,7 +440,7 @@ __global__ void kernelRenderCircles() {
     }
 }
 
-__global__ void kernelRenderPixels(int* circlesInBox, int numCirclesPerBox) {
+__global__ void kernelRenderPixels(int batchIndex) {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= cuConstRendererParams.imageHeight * cuConstRendererParams.imageWidth)
@@ -458,8 +462,9 @@ __global__ void kernelRenderPixels(int* circlesInBox, int numCirclesPerBox) {
     // printf("boxIndex: %d, circleCounts[boxIndex]: %d\n", boxIndex, circleCounts[boxIndex]);
     int offset = 0; 
     while (true) {
-        int circleIndex = circlesInBox[boxIndex * numCirclesPerBox + offset];
-        if (circleIndex == -1) { break; }
+        short circleIndex_ = cuConstRendererParams.circlesInBox[boxIndex * MAX_CIRCLES_PER_BOX + offset];
+        if (circleIndex_ == -1) { break; }
+        int circleIndex = batchIndex * NUM_CIRCLES_PER_BATCH + circleIndex_;  
         int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
         float rad = cuConstRendererParams.radius[circleIndex];
@@ -502,9 +507,9 @@ __global__ void kernelRenderPixels(int* circlesInBox, int numCirclesPerBox) {
     *imgPtr = newColor;
 }
 
-__global__ void assignCirclesToBoxes(int* circlesInBox, int numCirclesPerBox, int batchIndex) {
+__global__ void assignCirclesToBoxes(int batchIndex) {
     int boxIndex = blockIdx.x; 
-    int offset = threadIdx.x; 
+    short offset = threadIdx.x; 
     int circleIndex = batchIndex * NUM_CIRCLES_PER_BATCH + offset; 
     __shared__ uint circleMask[NUM_CIRCLES_PER_BATCH];
 
@@ -545,8 +550,8 @@ __global__ void assignCirclesToBoxes(int* circlesInBox, int numCirclesPerBox, in
 
     int flagIndex = 0; 
     if (offset == NUM_CIRCLES_PER_BATCH - 1) {
-        flagIndex = boxIndex * numCirclesPerBox + prefixSum_circleMask[offset] + circleMask[offset]; 
-        circlesInBox[flagIndex] = -1;
+        flagIndex = boxIndex * MAX_CIRCLES_PER_BOX + prefixSum_circleMask[offset] + circleMask[offset]; 
+        cuConstRendererParams.circlesInBox[flagIndex] = -1;
     }
 
     if (circleIndex >= cuConstRendererParams.numCircles) {
@@ -554,8 +559,8 @@ __global__ void assignCirclesToBoxes(int* circlesInBox, int numCirclesPerBox, in
     }
 
     if (circleMask[offset] != 0) {
-        flagIndex = boxIndex * numCirclesPerBox + prefixSum_circleMask[offset];
-        circlesInBox[flagIndex] = circleIndex;
+        flagIndex = boxIndex * MAX_CIRCLES_PER_BOX + prefixSum_circleMask[offset];
+        cuConstRendererParams.circlesInBox[flagIndex] = offset;
         // if (boxIndex <= 3200 && boxIndex >= 3190) { printf("marking circle %d in box %d. circlesInBox[%d] = %d.\n", circleIndex, boxIndex, flagIndex, circleIndex); }
     }
 }
@@ -658,6 +663,8 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
+    int numBoxes = ((image->height + 16 - 1) / 16) * ((image->width + 16 - 1) / 16); 
+    cudaMalloc(&cudaDeviceCirclesInBox, sizeof(short) * NUM_CIRCLES_PER_BATCH * numBoxes);
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -682,6 +689,7 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
+    params.circlesInBox = cudaDeviceCirclesInBox; 
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -772,7 +780,6 @@ CudaRenderer::render() {
     int boxWidth = BOX_WIDTH;
     int numBoxes = (image->width / boxWidth) * (image->height / boxWidth);
     int numPixels = image->width * image->height;
-    int numCirclesPerBox = min(MAX_CIRCLES_PER_BOX, numCircles) + 1; 
 
     dim3 scanDim(NUM_CIRCLES_PER_BATCH, 1); 
     dim3 gridDimScan(numBoxes, 1);
@@ -782,31 +789,12 @@ CudaRenderer::render() {
 
     int sharedMemSize = NUM_CIRCLES_PER_BATCH * 4; 
 
-    // Allocate double-buffered memory for the data structure to keep track of circles in boxes
-    int* circlesInBox[2];
-    for (int i = 0; i < 2; ++i) {
-        cudaMalloc(&circlesInBox[i], sizeof(int) * numBoxes * numCirclesPerBox);
-    }
-
-    int a = 0; // buffer that assignCirclesToBoxes will write to
-    int r = 1; // buffer that kernelRenderPixels will read from
     int numBatches = (numCircles + NUM_CIRCLES_PER_BATCH - 1) / NUM_CIRCLES_PER_BATCH; // number of circle batches
     int batchIndex = 0; 
 
-    // Assign to first <=1024 circles
-    assignCirclesToBoxes<<<gridDimScan, scanDim, sharedMemSize>>>(circlesInBox[a], numCirclesPerBox, batchIndex);
-    cudaDeviceSynchronize();
-
-    for (batchIndex = 1; batchIndex < numBatches; batchIndex ++) {
-        a = batchIndex % 2; // place this calculation inside the function?
-        r = (batchIndex + 1) % 2;
-
-        kernelRenderPixels<<<gridDimRender, renderDim>>>(circlesInBox[r], numCirclesPerBox);
-        assignCirclesToBoxes<<<gridDimScan, scanDim, sharedMemSize>>>(circlesInBox[a], numCirclesPerBox, batchIndex);
+    for (batchIndex = 0; batchIndex < numBatches; batchIndex ++) {
+        assignCirclesToBoxes<<<gridDimScan, scanDim, sharedMemSize>>>(batchIndex);
+        kernelRenderPixels<<<gridDimRender, renderDim>>>(batchIndex);
         cudaDeviceSynchronize(); 
     }
-
-    // Render last <= 1024 circles
-    kernelRenderPixels<<<gridDimRender, renderDim>>>(circlesInBox[a], numCirclesPerBox);
-    cudaDeviceSynchronize();
 }
